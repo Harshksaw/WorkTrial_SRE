@@ -15,8 +15,8 @@ services:
   frankfurt:
     image: worktrial-sre:latest
     ports: ["8004:80"]
-    environment: { LOCATION: frankfurt, VERSION: v1, BASE_LATENCY_MS: "450" }
+    environment: { LOCATION: frankfurt, VERSION: v1, BASE_LATENCY_MS: "600" }
   singapore:
     image: worktrial-sre:latest
     ports: ["8005:80"]
-    environment: { LOCATION: singapore, VERSION: v1, BASE_LATENCY_MS: "600" }
+    environment: { LOCATION: singapore, VERSION: v1, BASE_LATENCY_MS: "800" }
