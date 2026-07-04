@@ -1,7 +1,7 @@
 [project]
 name = "worktrial-sre"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local multi-location SRE deployment simulation for PolarGrid work trial"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
