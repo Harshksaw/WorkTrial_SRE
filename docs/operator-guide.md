@@ -1,168 +1,242 @@
 # Operator Guide
 
-A runbook for driving the fleet end-to-end: set up, deploy, inspect, break, roll out,
-roll back, and tear down. Everything runs locally with Docker Compose.
+This is the runbook for setting up, deploying, monitoring, breaking, rolling out, rolling back, and cleaning up the local multi-location fleet.
 
 ## Prerequisites
 
-- Docker + Docker Compose v2 (`docker compose version`)
-- `curl` and `jq` (used for inspection)
-- `python3` (used by `ops-canary.sh`)
-- Optional, for running the app outside Docker: [`uv`](https://docs.astral.sh/uv/)
+Required tools:
 
-## City → port map
+```bash
+docker compose version
+bash --version
+python3 --version
+curl --version
+```
 
-| City      | Port | City      | Port |
-|-----------|------|-----------|------|
-| vancouver | 8001 | frankfurt | 8004 |
-| toronto   | 8002 | singapore | 8005 |
-| london    | 8003 |           |      |
+No cloud account, GPU, Kubernetes cluster, or external monitoring system is required.
 
-All endpoints are `http://localhost:<port>` → `/health`, `/ready`, `/metrics`, `/infer`.
+## Location map
 
----
+| Location | URL |
+|---|---|
+| vancouver | `http://localhost:8001` |
+| toronto | `http://localhost:8002` |
+| london | `http://localhost:8003` |
+| frankfurt | `http://localhost:8004` |
+| singapore | `http://localhost:8005` |
+
+Every location exposes `/health`, `/ready`, `/metrics`, `/metrics/prometheus`, and `/infer`.
 
 ## 1. Set up the environment
 
-```bash
-# from the repo root
-cp /dev/null .env 2>/dev/null || true      # optional: start with empty fleet overrides
-# NOTE: .env currently sets DEGRADED_MODE=true (whole fleet misbehaves).
-# Remove or set it to false for a healthy baseline:
-echo 'DEGRADED_MODE=false' > .env
-
-# Build the image (tagged worktrial-sre:latest via the vancouver service)
-docker compose build
-```
-
-To run a single instance without Docker (quick sanity check):
+From the repository root:
 
 ```bash
-uv sync
-LOCATION=vancouver BASE_LATENCY_MS=120 uv run fastapi run app/main.py --port 8001
+bash ops setup
 ```
 
-## 2. Deploy the system
+This builds the `worktrial-sre:latest` image from the local `Dockerfile`.
+
+## 2. Deploy the full fleet
 
 ```bash
-docker compose up -d          # start all 5 cities
-docker compose ps             # confirm they're up
+bash ops deploy all v1
 ```
 
-Each city warms up for ~2s. `/health` is immediately `200`; `/ready` returns `503`
-until warmup finishes, then `200`.
+This starts all five locations on version `v1`.
 
-## 3. Inspect health / performance
-
-Single city:
+Check container state:
 
 ```bash
-curl -s localhost:8001/health  | jq
-curl -s localhost:8001/ready   | jq
-curl -s localhost:8001/metrics | jq
+docker compose ps
 ```
 
-Send some inference traffic (metrics are computed over the last 200 requests, so they
-need traffic to be meaningful):
+## 3. Check status
+
+Use the built-in fleet view:
 
 ```bash
-for i in $(seq 1 30); do
-  curl -s -o /dev/null -X POST localhost:8001/infer \
-    -H 'content-type: application/json' -d '{"prompt":"hello"}'
-done
+bash ops status
 ```
 
-**Fleet status table** — poll every city at once:
+On a fresh deploy there may be little latency/error data because no inference traffic has happened yet. To generate probe traffic and then print status:
 
 ```bash
-for p in 8001 8002 8003 8004 8005; do
-  curl -s "localhost:$p/metrics" | jq -r \
-    '[.location, .version, .request_count, (.error_rate*100|floor|tostring+"%"),
-      (.p95_ms|floor|tostring+"ms"), (.gpu_utilization*100|floor|tostring+"%")]
-     | @tsv'
-done | column -t -N CITY,VERSION,REQS,ERR_RATE,P95,GPU
+bash ops status --probe
 ```
 
-## 4. Simulate failure
+The status table answers the core operator questions: which locations are healthy, which are degraded, which has the worst p95 latency, which are erroring, whether any appear overloaded, and what version is running where.
 
-Two ways to make a city go "up but bad" (alive, but slow and erroring):
+| Column | Meaning |
+|---|---|
+| `CITY` | Location identity. |
+| `STATE` | `HEALTHY`, `DEGRADED`, `OVERLOADED`, `UNREADY`, or `DOWN`. |
+| `VER` | Deployed version from `/health`. |
+| `READY` | Whether `/ready` is passing. |
+| `REQ` | Total inference requests observed by that process. |
+| `ERR` | Error rate. |
+| `P95` | Rolling p95 latency. |
+| `RPS` | Recent 60-second throughput. |
+| `GPU` | Simulated GPU utilization. |
+| `MEM` | Simulated GPU memory pressure. |
+| `QUEUE` | Simulated queue depth. |
 
-**A. During a canary** (recommended — self-contained and auto-reverts):
+## 4. Inspect one location manually
 
 ```bash
-./ops-canary.sh v2 toronto --bad     # deploys v2 to toronto with DEGRADED_MODE=true
+curl -s localhost:8001/health | python3 -m json.tool
+curl -s localhost:8001/ready | python3 -m json.tool
+curl -s localhost:8001/metrics | python3 -m json.tool
 ```
 
-The `--bad` flag forces the new version into degraded mode; the health gate will
-catch it and roll toronto back automatically (see §6).
-
-**B. Manually** — recreate one city in degraded mode:
+Send one inference request:
 
 ```bash
-docker compose up -d --no-deps -e DEGRADED_MODE=true london
-curl -s localhost:8003/metrics | jq '{error_rate, p95_ms}'   # elevated error rate + tail
+curl -s -X POST localhost:8001/infer \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"hello from vancouver","max_tokens":8}' | python3 -m json.tool
 ```
 
-Fleet-wide failure for a demo: set `DEGRADED_MODE=true` in `.env` and
-`docker compose up -d`.
-
-## 5. Perform a rollout (canary with health gate)
-
-Roll a new version to **one** city and let the gate decide if it's safe to go wider:
+Generate load:
 
 ```bash
-./ops-canary.sh v2 vancouver         # canary v2 on vancouver
+bash ops load all 50
+bash ops status
 ```
 
-What happens:
-1. Records vancouver's current version (rollback target).
-2. Deploys `v2` to **only** vancouver.
-3. Waits for `/ready` (up to ~15s).
-4. Sends 25 probe requests to populate `/metrics`.
-5. Evaluates the gate: **health 200 AND error_rate ≤ 5%**.
-   - **PASS** → vancouver stays on `v2`; you may now roll the other cities.
-   - **FAIL** → vancouver is rolled back automatically.
+## 5. Deploy one location
 
-Roll the rest of the fleet once the canary passes (repeat per city, or script it):
+Deploy only Toronto to `v2`:
 
 ```bash
-for city in toronto london frankfurt singapore; do
-  ./ops-canary.sh v2 "$city" || { echo "STOP: $city failed the gate"; break; }
-done
+bash ops deploy toronto v2
+bash ops status --probe
 ```
 
-## 6. Perform a rollback
+Only Toronto should report `v2`; the other locations should remain on their previous versions.
 
-Rollback is automatic on gate failure. To roll a city back manually, re-canary it onto
-the known-good version (the gate will pass and it settles there):
+## 6. Simulate a degraded location
+
+Latency degradation:
 
 ```bash
-./ops-canary.sh v1 vancouver         # revert vancouver to v1
+bash ops degrade london latency
 ```
 
-Or directly via Compose (immediate, no gate):
+Error-heavy degradation:
 
 ```bash
-docker compose up -d --no-deps -e VERSION=v1 -e DEGRADED_MODE=false vancouver
-curl -s localhost:8001/health | jq .version     # confirm -> "v1"
+bash ops degrade london errors
 ```
 
-## 7. Tear everything down
+Overload-like degradation:
 
 ```bash
-docker compose down            # stop + remove all 5 cities
-docker compose down --rmi local -v   # also remove the built image and volumes
+bash ops degrade london overload
 ```
 
----
+Failing readiness/health:
+
+```bash
+bash ops degrade london failing
+```
+
+Then inspect:
+
+```bash
+bash ops status
+```
+
+Recover the location:
+
+```bash
+bash ops recover london
+bash ops status --probe
+```
+
+## 7. Canary one location
+
+Deploy a new version to one location and gate it before promoting wider:
+
+```bash
+bash ops canary v2 vancouver
+```
+
+The canary flow:
+
+1. Reads the current version from `/health`.
+2. Recreates only the target location with the new version.
+3. Waits for `/ready`.
+4. Sends probe `/infer` traffic.
+5. Checks the gate.
+6. Leaves the canary on the new version if it passes.
+7. Rolls back that one location if it fails.
+
+Bad canary demo:
+
+```bash
+bash ops canary v3 vancouver --bad
+```
+
+The `--bad` flag intentionally applies degraded behavior to the canary. The gate should fail and automatically roll back Vancouver to the previous version.
+
+## 8. Roll out globally with safety gates
+
+```bash
+bash ops rollout v2
+```
+
+This performs a canary on Vancouver first, then promotes Toronto, London, Frankfurt, and Singapore one at a time. Each location must pass its gate before the next location is touched. If any location fails, rollout stops, that location is rolled back, and locations not yet touched remain unchanged.
+
+Bad rollout demo:
+
+```bash
+bash ops rollout v3 --bad
+```
+
+The bad release is injected at the canary stage, so it should not propagate beyond Vancouver.
+
+## 9. Roll back one location
+
+Rollback to the automatically recorded previous version:
+
+```bash
+bash ops rollback toronto
+```
+
+Rollback to an explicit version:
+
+```bash
+bash ops rollback toronto v1
+```
+
+Confirm:
+
+```bash
+bash ops status --probe
+```
+
+## 10. Tear down
+
+```bash
+bash ops teardown
+```
+
+This stops the fleet and removes `.ops-state`.
+
+For a deeper Docker cleanup:
+
+```bash
+docker compose down --remove-orphans --rmi local -v
+```
 
 ## Troubleshooting
 
-| Symptom                                   | Likely cause / fix                                            |
-|-------------------------------------------|--------------------------------------------------------------|
-| `/ready` stuck on 503                     | Still within the ~2s warmup; wait and retry.                 |
-| `/metrics` shows `request_count: 0`       | No traffic yet — send some `/infer` requests first.          |
-| Every city is erroring / slow             | `.env` has `DEGRADED_MODE=true`; set to false and redeploy.  |
-| Canary reports FAIL immediately           | Ran with `--bad`, or the target version is genuinely broken. |
-| `unknown city` from `ops-canary.sh`       | Use one of: vancouver, toronto, london, frankfurt, singapore.|
-| Port already in use on `up`               | Another process holds 8001–8005; free it or stop old stack.  |
+| Symptom | Fix |
+|---|---|
+| `docker compose` not found | Install Docker Desktop or Docker Engine with Compose v2. |
+| Port already in use | Stop the process using ports `8001`-`8005` or change ports in `docker-compose.yml`. |
+| `/ready` returns `503` right after deploy | Wait a few seconds; each instance has a warmup delay. |
+| `REQ` is `0` in status | Run `bash ops status --probe` or `bash ops load all 50`. |
+| A location stays degraded | Run `bash ops recover LOCATION` or `bash ops rollback LOCATION v1`. |
+| Rollout stops | This is expected when a gate fails; inspect `bash ops status`, then rollback/recover the bad location. |
