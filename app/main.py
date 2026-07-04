@@ -243,13 +243,19 @@ async def infer(request: InferRequest):
     if random.random() < behavior["tail_probability"]:
         latency_ms += float(behavior["tail_latency_ms"])
 
-    start = time.monotonic()
-    IN_FLIGHT += 1
-    await asyncio.sleep(latency_ms / 1000.0)
-    observed_latency_ms = (time.monotonic() - start) * 1000.0
-    IN_FLIGHT -= 1
+    async with METRIC_LOCK:
+        IN_FLIGHT += 1
 
+    start = time.monotonic()
+    try:
+        await asyncio.sleep(latency_ms / 1000.0)
+    finally:
+        async with METRIC_LOCK:
+            IN_FLIGHT = max(0, IN_FLIGHT - 1)
+
+    observed_latency_ms = (time.monotonic() - start) * 1000.0
     failed = random.random() < behavior["error_rate"]
+
     async with METRIC_LOCK:
         REQUEST_COUNT += 1
         if failed:
