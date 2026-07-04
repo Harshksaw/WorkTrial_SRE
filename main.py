@@ -12,6 +12,9 @@ from pydantic import BaseModel
 LOCATION = os.getenv("LOCATION", "local")
 VERSION = os.getenv("VERSION", "v1")
 BASE_LATENCY_MS = int(os.getenv("BASE_LATENCY_MS", "100"))
+ERROR_RATE= float(os.getenv("ERROR_RATE", "0.0"))
+TAIL_LATENCY_MS = int(os.getenv("TAIL_LATENCY_MS", "0"))
+DEGRADED_MODE= os.getenv("DEGRADED_MODE", "false").lower() == "true"
 
 app = FastAPI()
 
@@ -79,13 +82,37 @@ def metrics():
 
 @app.post("/infer")
 def infer(request: InferRequest):
-    global REQUEST_COUNT
+    global REQUEST_COUNT, ERROR_COUNT
     start = time.monotonic()
     # Simulate model inference time.
-    time.sleep(BASE_LATENCY_MS / 1000)
+
+    effective_error_rate = ERROR_RATE
+    effective_tail_ms = TAIL_LATENCY_MS
+    tail_probability = 0.1
+    if DEGRADED_MODE:
+        effective_error_rate = max (effective_error_rate, 0.25)
+
+        effective_tail_ms = max(effective_tail_ms,BASE_LATENCY_MS ) 
+        tail_probability = 0.7
+
+    latency_s = BASE_LATENCY_MS /1000
+
+    if effective_tail_ms and random.random() < tail_probability:
+        latency_s += effective_tail_ms/ 1000
+        
+    time.sleep(latency_s)
     latency_ms = (time.monotonic() - start) * 1000
+    if random.random() < ERROR_RATE:
+        ERROR_COUNT +=1
+        return JSONResponse(status_code=500, content={"error": "simulated error"})
 
     REQUEST_COUNT += 1
     LATENCIES_MS.append(latency_ms)
+     
+    if random.random() < effective_error_rate:
+        ERROR_COUNT +=1
+        return JSONResponse(status_code=500, content={"error": "inference failed", "location": LOCATION})
+    
+
 
     return {"completion": f"echo: {request.prompt}", "location": LOCATION}
