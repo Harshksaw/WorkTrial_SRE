@@ -12,7 +12,7 @@ port_for() {
     london) echo 8003 ;;
     frankfurt) echo 8004 ;;
     singapore) echo 8005 ;;
-    *) echo "unknown location: ${1:-}" >&2; exit 2 ;;
+    *) echo "unknown location: ${1:-}" >&2; return 2 ;;
   esac
 }
 
@@ -25,7 +25,7 @@ is_location() {
 }
 
 usage() {
-  cat <<'EOF'
+  cat <<'EOF_USAGE'
 PolarGrid local SRE fleet simulator
 
 Usage:
@@ -50,7 +50,7 @@ Examples:
   bash ops rollout v3 --bad        # demonstrates failed canary + rollback
   bash ops rollback vancouver v1
   bash ops teardown
-EOF
+EOF_USAGE
 }
 
 ensure_state_dir() {
@@ -58,7 +58,9 @@ ensure_state_dir() {
 }
 
 base_url() {
-  echo "http://localhost:$(port_for "$1")"
+  local port
+  port="$(port_for "$1")" || return 2
+  echo "http://localhost:$port"
 }
 
 curl_code() {
@@ -71,8 +73,9 @@ json_field() {
 }
 
 current_version() {
-  local location="$1"
-  curl -sS --max-time 3 "$(base_url "$location")/health" 2>/dev/null | json_field version
+  local location="$1" url
+  url="$(base_url "$location")" || return 2
+  curl -sS --max-time 3 "$url/health" 2>/dev/null | json_field version
 }
 
 write_override() {
@@ -92,12 +95,16 @@ write_override() {
 }
 
 deploy_location() {
-  local location="$1" version="$2" degraded="${3:-false}" health_state="${4:-ok}" error_rate="${5:-0.0}" tail_ms="${6:-}"
+  local location="$1" version="$2" degraded="${3:-false}" health_state="${4:-ok}" error_rate="${5:-0.0}" tail_ms="${6:-}" record_previous="${7:-true}"
+  is_location "$location" || { echo "unknown location: $location" >&2; return 2; }
   ensure_state_dir
+
   local old_version
-  old_version="$(current_version "$location")"
+  old_version="$(current_version "$location")" || old_version="v1"
   [[ "$old_version" == "unknown" || -z "$old_version" ]] && old_version="v1"
-  echo "$old_version" > "$STATE_DIR/$location.previous"
+  if [[ "$record_previous" == "true" && "$old_version" != "$version" ]]; then
+    echo "$old_version" > "$STATE_DIR/$location.previous"
+  fi
 
   local override
   override="$(mktemp)"
@@ -109,10 +116,10 @@ deploy_location() {
 
 wait_ready() {
   local location="$1" attempts="${2:-20}" url code
-  url="$(base_url "$location")/ready"
+  url="$(base_url "$location")" || return 2
   printf "[ready] waiting for %s" "$location"
   for _ in $(seq 1 "$attempts"); do
-    code="$(curl_code "$url")"
+    code="$(curl_code "$url/ready")"
     if [[ "$code" == "200" ]]; then
       echo " ready"
       return 0
@@ -126,9 +133,9 @@ wait_ready() {
 
 probe_location() {
   local location="$1" count="${2:-30}" url
-  url="$(base_url "$location")/infer"
+  url="$(base_url "$location")" || return 2
   for _ in $(seq 1 "$count"); do
-    curl -sS -o /dev/null --max-time 5 -X POST "$url" \
+    curl -sS -o /dev/null --max-time 5 -X POST "$url/infer" \
       -H 'content-type: application/json' \
       -d '{"prompt":"canary probe","max_tokens":8}' &
   done
@@ -136,10 +143,11 @@ probe_location() {
 }
 
 gate_location() {
-  local location="$1" metrics health ready
-  health="$(curl_code "$(base_url "$location")/health")"
-  ready="$(curl_code "$(base_url "$location")/ready")"
-  metrics="$(curl -sS --max-time 3 "$(base_url "$location")/metrics" 2>/dev/null || echo '{}')"
+  local location="$1" metrics health ready url
+  url="$(base_url "$location")" || return 2
+  health="$(curl_code "$url/health")"
+  ready="$(curl_code "$url/ready")"
+  metrics="$(curl -sS --max-time 3 "$url/metrics" 2>/dev/null || echo '{}')"
   METRICS="$metrics" HEALTH="$health" READY="$ready" python3 - <<'PY'
 import json
 import os
@@ -171,11 +179,11 @@ status() {
   local probe="${1:-}"
   if [[ "$probe" == "--probe" ]]; then
     for location in "${LOCATIONS[@]}"; do
-      probe_location "$location" 10
+      probe_location "$location" 10 || true
     done
   fi
 
-  python3 - "$@" <<'PY'
+  python3 - <<'PY'
 import json
 import urllib.error
 import urllib.request
@@ -272,7 +280,7 @@ deploy() {
     deploy_location "$target" "$version" false ok 0.0
   else
     echo "unknown deploy target: $target" >&2
-    exit 2
+    return 2
   fi
 }
 
@@ -286,12 +294,13 @@ load() {
     probe_location "$target" "$count"
   else
     echo "unknown load target: $target" >&2
-    exit 2
+    return 2
   fi
 }
 
 degrade() {
   local location="${1:?usage: bash ops degrade LOCATION [latency|errors|overload|failing]}" mode="${2:-latency}"
+  is_location "$location" || { echo "unknown location: $location" >&2; return 2; }
   local version
   version="$(current_version "$location")"
   [[ "$version" == "unknown" || -z "$version" ]] && version="v1"
@@ -300,7 +309,7 @@ degrade() {
     errors) deploy_location "$location" "$version" true degraded 0.50 400 ;;
     overload) deploy_location "$location" "$version" true degraded 0.25 800 ;;
     failing) deploy_location "$location" "$version" true failing 0.75 1500 ;;
-    *) echo "unknown degrade mode: $mode" >&2; exit 2 ;;
+    *) echo "unknown degrade mode: $mode" >&2; return 2 ;;
   esac
   wait_ready "$location" 5 || true
   probe_location "$location" 25 || true
@@ -309,6 +318,7 @@ degrade() {
 
 recover() {
   local location="${1:?usage: bash ops recover LOCATION}" version
+  is_location "$location" || { echo "unknown location: $location" >&2; return 2; }
   version="$(current_version "$location")"
   [[ "$version" == "unknown" || -z "$version" ]] && version="v1"
   deploy_location "$location" "$version" false ok 0.0
@@ -317,7 +327,7 @@ recover() {
 
 canary() {
   local version="${1:?usage: bash ops canary VERSION [LOCATION] [--bad]}" location="${2:-vancouver}" bad="${3:-}"
-  is_location "$location" || { echo "unknown location: $location" >&2; exit 2; }
+  is_location "$location" || { echo "unknown location: $location" >&2; return 2; }
 
   local old_version degraded health_state error_rate tail_ms
   old_version="$(current_version "$location")"
@@ -338,8 +348,8 @@ canary() {
   deploy_location "$location" "$version" "$degraded" "$health_state" "$error_rate" "$tail_ms"
   if ! wait_ready "$location" 20; then
     echo "[canary] $location never became ready; rolling back to $old_version"
-    deploy_location "$location" "$old_version" false ok 0.0
-    exit 1
+    deploy_location "$location" "$old_version" false ok 0.0 "" false
+    return 1
   fi
 
   echo "[canary] probing $location before promotion"
@@ -349,9 +359,9 @@ canary() {
     echo "[canary] PASS: $location remains on $version; safe to continue"
   else
     echo "[canary] FAIL: rolling $location back to $old_version; other locations untouched"
-    deploy_location "$location" "$old_version" false ok 0.0
+    deploy_location "$location" "$old_version" false ok 0.0 "" false
     wait_ready "$location" 20 || true
-    exit 1
+    return 1
   fi
 }
 
@@ -361,7 +371,7 @@ rollout() {
   echo "[rollout] starting gated rollout for $version"
   if ! canary "$version" "$canary_city" "$bad"; then
     echo "[rollout] stopped: canary failed, no wider rollout"
-    exit 1
+    return 1
   fi
 
   for location in toronto london frankfurt singapore; do
@@ -372,7 +382,7 @@ rollout() {
     if ! gate_location "$location"; then
       echo "[rollout] STOP: $location failed gate; rolling it back and leaving remaining cities unchanged"
       rollback "$location"
-      exit 1
+      return 1
     fi
   done
   echo "[rollout] complete: all locations are on $version"
@@ -381,12 +391,12 @@ rollout() {
 
 rollback() {
   local location="${1:?usage: bash ops rollback LOCATION [VERSION]}" version="${2:-}"
-  is_location "$location" || { echo "unknown location: $location" >&2; exit 2; }
+  is_location "$location" || { echo "unknown location: $location" >&2; return 2; }
   if [[ -z "$version" ]]; then
     version="$(cat "$STATE_DIR/$location.previous" 2>/dev/null || echo v1)"
   fi
   echo "[rollback] $location -> $version"
-  deploy_location "$location" "$version" false ok 0.0
+  deploy_location "$location" "$version" false ok 0.0 "" false
   wait_ready "$location" 20 || true
 }
 
