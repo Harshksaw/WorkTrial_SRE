@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMPOSE=(docker compose -f docker-compose.yml)
+STATE_DIR=".ops-state"
+LOCATIONS=(vancouver toronto london frankfurt singapore)
+
+port_for() {
+  case "${1:-}" in
+    vancouver) echo 8001 ;;
+    toronto) echo 8002 ;;
+    london) echo 8003 ;;
+    frankfurt) echo 8004 ;;
+    singapore) echo 8005 ;;
+    *) echo "unknown location: ${1:-}" >&2; exit 2 ;;
+  esac
+}
+
+is_location() {
+  local candidate="${1:-}"
+  for location in "${LOCATIONS[@]}"; do
+    [[ "$candidate" == "$location" ]] && return 0
+  done
+  return 1
+}
+
+usage() {
+  cat <<'EOF'
+PolarGrid local SRE fleet simulator
+
+Usage:
+  bash ops setup
+  bash ops deploy [all|LOCATION] [VERSION]
+  bash ops status [--probe]
+  bash ops load [LOCATION|all] [REQUESTS]
+  bash ops degrade LOCATION [latency|errors|overload|failing]
+  bash ops recover LOCATION
+  bash ops canary VERSION [LOCATION] [--bad]
+  bash ops rollout VERSION [--bad]
+  bash ops rollback LOCATION [VERSION]
+  bash ops teardown
+
+Examples:
+  bash ops setup
+  bash ops deploy all v1
+  bash ops status --probe
+  bash ops degrade london latency
+  bash ops canary v2 vancouver
+  bash ops rollout v2
+  bash ops rollout v3 --bad        # demonstrates failed canary + rollback
+  bash ops rollback vancouver v1
+  bash ops teardown
+EOF
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+}
+
+base_url() {
+  echo "http://localhost:$(port_for "$1")"
+}
+
+curl_code() {
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null || true
+}
+
+json_field() {
+  local field="$1"
+  python3 -c "import json,sys; print(json.load(sys.stdin).get('$field', 'unknown'))" 2>/dev/null || echo unknown
+}
+
+current_version() {
+  local location="$1"
+  curl -sS --max-time 3 "$(base_url "$location")/health" 2>/dev/null | json_field version
+}
+
+write_override() {
+  local file="$1" location="$2" version="$3" degraded="$4" health_state="${5:-ok}" error_rate="${6:-0.0}" tail_ms="${7:-}"
+  {
+    echo "services:"
+    echo "  $location:"
+    echo "    environment:"
+    echo "      VERSION: \"$version\""
+    echo "      DEGRADED_MODE: \"$degraded\""
+    echo "      HEALTH_STATE: \"$health_state\""
+    echo "      ERROR_RATE: \"$error_rate\""
+    if [[ -n "$tail_ms" ]]; then
+      echo "      TAIL_LATENCY_MS: \"$tail_ms\""
+    fi
+  } > "$file"
+}
+
+deploy_location() {
+  local location="$1" version="$2" degraded="${3:-false}" health_state="${4:-ok}" error_rate="${5:-0.0}" tail_ms="${6:-}"
+  ensure_state_dir
+  local old_version
+  old_version="$(current_version "$location")"
+  [[ "$old_version" == "unknown" || -z "$old_version" ]] && old_version="v1"
+  echo "$old_version" > "$STATE_DIR/$location.previous"
+
+  local override
+  override="$(mktemp)"
+  write_override "$override" "$location" "$version" "$degraded" "$health_state" "$error_rate" "$tail_ms"
+  "${COMPOSE[@]}" -f "$override" up -d --no-deps --build "$location" >/dev/null
+  rm -f "$override"
+  echo "[deploy] $location -> $version degraded=$degraded health_state=$health_state"
+}
+
+wait_ready() {
+  local location="$1" attempts="${2:-20}" url code
+  url="$(base_url "$location")/ready"
+  printf "[ready] waiting for %s" "$location"
+  for _ in $(seq 1 "$attempts"); do
+    code="$(curl_code "$url")"
+    if [[ "$code" == "200" ]]; then
+      echo " ready"
+      return 0
+    fi
+    printf "."
+    sleep 1
+  done
+  echo " not-ready"
+  return 1
+}
+
+probe_location() {
+  local location="$1" count="${2:-30}" url
+  url="$(base_url "$location")/infer"
+  for _ in $(seq 1 "$count"); do
+    curl -sS -o /dev/null --max-time 5 -X POST "$url" \
+      -H 'content-type: application/json' \
+      -d '{"prompt":"canary probe","max_tokens":8}' &
+  done
+  wait || true
+}
+
+gate_location() {
+  local location="$1" metrics health ready
+  health="$(curl_code "$(base_url "$location")/health")"
+  ready="$(curl_code "$(base_url "$location")/ready")"
+  metrics="$(curl -sS --max-time 3 "$(base_url "$location")/metrics" 2>/dev/null || echo '{}')"
+  METRICS="$metrics" HEALTH="$health" READY="$ready" python3 - <<'PY'
+import json
+import os
+import sys
+
+try:
+    m = json.loads(os.environ.get("METRICS") or "{}")
+except json.JSONDecodeError:
+    m = {}
+
+health_ok = os.environ.get("HEALTH") == "200"
+ready_ok = os.environ.get("READY") == "200"
+err = float(m.get("error_rate", 1.0))
+p95 = float(m.get("p95_ms", 999999))
+overloaded = bool(m.get("overloaded", True))
+degraded = bool(m.get("degraded", True))
+
+ok = health_ok and ready_ok and err <= 0.05 and p95 <= 750 and not overloaded and not degraded
+print(
+    f"[gate] health={'ok' if health_ok else 'bad'} ready={'ok' if ready_ok else 'bad'} "
+    f"err={err:.1%} p95={p95:.0f}ms overloaded={overloaded} degraded={degraded} -> "
+    f"{'PASS' if ok else 'FAIL'}"
+)
+sys.exit(0 if ok else 1)
+PY
+}
+
+status() {
+  local probe="${1:-}"
+  if [[ "$probe" == "--probe" ]]; then
+    for location in "${LOCATIONS[@]}"; do
+      probe_location "$location" 10
+    done
+  fi
+
+  python3 - "$@" <<'PY'
+import json
+import urllib.error
+import urllib.request
+
+locations = [
+    ("vancouver", 8001),
+    ("toronto", 8002),
+    ("london", 8003),
+    ("frankfurt", 8004),
+    ("singapore", 8005),
+]
+
+def get_json(url):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            return response.status, json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode())
+        except Exception:
+            return exc.code, {}
+    except Exception:
+        return 0, {}
+
+rows = []
+for city, port in locations:
+    base = f"http://localhost:{port}"
+    health_code, health = get_json(base + "/health")
+    ready_code, _ready = get_json(base + "/ready")
+    _metrics_code, metrics = get_json(base + "/metrics")
+
+    if health_code == 0:
+        state = "DOWN"
+    elif health_code != 200 or ready_code != 200:
+        state = "UNREADY"
+    elif metrics.get("degraded") or metrics.get("error_rate", 0) > 0.05:
+        state = "DEGRADED"
+    elif metrics.get("overloaded"):
+        state = "OVERLOADED"
+    else:
+        state = "HEALTHY"
+
+    rows.append({
+        "city": city,
+        "port": port,
+        "state": state,
+        "version": health.get("version") or metrics.get("version", "unknown"),
+        "ready": "yes" if ready_code == 200 else "no",
+        "req": metrics.get("request_count", 0),
+        "err": float(metrics.get("error_rate", 0.0) or 0.0),
+        "p95": float(metrics.get("p95_ms", 0.0) or 0.0),
+        "rps": float(metrics.get("throughput_rps_60s", 0.0) or 0.0),
+        "gpu": float(metrics.get("gpu_utilization", 0.0) or 0.0),
+        "mem": float(metrics.get("gpu_memory_percent", 0.0) or 0.0),
+        "queue": int(metrics.get("queue_depth", 0) or 0),
+    })
+
+headers = ["CITY", "PORT", "STATE", "VER", "READY", "REQ", "ERR", "P95", "RPS", "GPU", "MEM", "QUEUE"]
+print("  ".join(f"{h:<10}" for h in headers))
+print("-" * 126)
+for row in rows:
+    print(
+        f"{row['city']:<10}  {row['port']:<10}  {row['state']:<10}  {row['version']:<10}  "
+        f"{row['ready']:<10}  {row['req']:<10}  {row['err']*100:>6.1f}%    "
+        f"{row['p95']:>6.0f}ms    {row['rps']:<10.2f}  {row['gpu']*100:>6.0f}%    "
+        f"{row['mem']*100:>6.0f}%    {row['queue']:<10}"
+    )
+
+worst = max(rows, key=lambda r: r["p95"])
+erroring = [r["city"] for r in rows if r["err"] > 0.05 or r["state"] in {"UNREADY", "DOWN"}]
+overloaded = [r["city"] for r in rows if r["state"] == "OVERLOADED" or r["gpu"] >= 0.90 or r["queue"] >= 50]
+degraded = [r["city"] for r in rows if r["state"] in {"DEGRADED", "UNREADY", "DOWN"}]
+
+print("\nFleet summary")
+print(f"  worst_latency: {worst['city']} p95={worst['p95']:.0f}ms")
+print(f"  degraded:      {', '.join(degraded) if degraded else 'none'}")
+print(f"  erroring:      {', '.join(erroring) if erroring else 'none'}")
+print(f"  overloaded:    {', '.join(overloaded) if overloaded else 'none'}")
+PY
+}
+
+setup() {
+  "${COMPOSE[@]}" build
+}
+
+deploy() {
+  local target="${1:-all}" version="${2:-v1}"
+  if [[ "$target" == "all" ]]; then
+    "${COMPOSE[@]}" build
+    for location in "${LOCATIONS[@]}"; do
+      deploy_location "$location" "$version" false ok 0.0
+    done
+  elif is_location "$target"; then
+    deploy_location "$target" "$version" false ok 0.0
+  else
+    echo "unknown deploy target: $target" >&2
+    exit 2
+  fi
+}
+
+load() {
+  local target="${1:-all}" count="${2:-50}"
+  if [[ "$target" == "all" ]]; then
+    for location in "${LOCATIONS[@]}"; do
+      probe_location "$location" "$count"
+    done
+  elif is_location "$target"; then
+    probe_location "$target" "$count"
+  else
+    echo "unknown load target: $target" >&2
+    exit 2
+  fi
+}
+
+degrade() {
+  local location="${1:?usage: bash ops degrade LOCATION [latency|errors|overload|failing]}" mode="${2:-latency}"
+  local version
+  version="$(current_version "$location")"
+  [[ "$version" == "unknown" || -z "$version" ]] && version="v1"
+  case "$mode" in
+    latency) deploy_location "$location" "$version" true degraded 0.10 1200 ;;
+    errors) deploy_location "$location" "$version" true degraded 0.50 400 ;;
+    overload) deploy_location "$location" "$version" true degraded 0.25 800 ;;
+    failing) deploy_location "$location" "$version" true failing 0.75 1500 ;;
+    *) echo "unknown degrade mode: $mode" >&2; exit 2 ;;
+  esac
+  wait_ready "$location" 5 || true
+  probe_location "$location" 25 || true
+  status
+}
+
+recover() {
+  local location="${1:?usage: bash ops recover LOCATION}" version
+  version="$(current_version "$location")"
+  [[ "$version" == "unknown" || -z "$version" ]] && version="v1"
+  deploy_location "$location" "$version" false ok 0.0
+  wait_ready "$location" 20
+}
+
+canary() {
+  local version="${1:?usage: bash ops canary VERSION [LOCATION] [--bad]}" location="${2:-vancouver}" bad="${3:-}"
+  is_location "$location" || { echo "unknown location: $location" >&2; exit 2; }
+
+  local old_version degraded health_state error_rate tail_ms
+  old_version="$(current_version "$location")"
+  [[ "$old_version" == "unknown" || -z "$old_version" ]] && old_version="v1"
+  echo "[canary] $location: $old_version -> $version"
+
+  degraded=false
+  health_state=ok
+  error_rate=0.0
+  tail_ms=""
+  if [[ "$bad" == "--bad" ]]; then
+    degraded=true
+    health_state=degraded
+    error_rate=0.40
+    tail_ms=1500
+  fi
+
+  deploy_location "$location" "$version" "$degraded" "$health_state" "$error_rate" "$tail_ms"
+  if ! wait_ready "$location" 20; then
+    echo "[canary] $location never became ready; rolling back to $old_version"
+    deploy_location "$location" "$old_version" false ok 0.0
+    exit 1
+  fi
+
+  echo "[canary] probing $location before promotion"
+  probe_location "$location" 40
+
+  if gate_location "$location"; then
+    echo "[canary] PASS: $location remains on $version; safe to continue"
+  else
+    echo "[canary] FAIL: rolling $location back to $old_version; other locations untouched"
+    deploy_location "$location" "$old_version" false ok 0.0
+    wait_ready "$location" 20 || true
+    exit 1
+  fi
+}
+
+rollout() {
+  local version="${1:?usage: bash ops rollout VERSION [--bad]}" bad="${2:-}"
+  local canary_city="vancouver"
+  echo "[rollout] starting gated rollout for $version"
+  if ! canary "$version" "$canary_city" "$bad"; then
+    echo "[rollout] stopped: canary failed, no wider rollout"
+    exit 1
+  fi
+
+  for location in toronto london frankfurt singapore; do
+    echo "[rollout] promoting $version to $location"
+    deploy_location "$location" "$version" false ok 0.0
+    wait_ready "$location" 20
+    probe_location "$location" 25
+    if ! gate_location "$location"; then
+      echo "[rollout] STOP: $location failed gate; rolling it back and leaving remaining cities unchanged"
+      rollback "$location"
+      exit 1
+    fi
+  done
+  echo "[rollout] complete: all locations are on $version"
+  status
+}
+
+rollback() {
+  local location="${1:?usage: bash ops rollback LOCATION [VERSION]}" version="${2:-}"
+  is_location "$location" || { echo "unknown location: $location" >&2; exit 2; }
+  if [[ -z "$version" ]]; then
+    version="$(cat "$STATE_DIR/$location.previous" 2>/dev/null || echo v1)"
+  fi
+  echo "[rollback] $location -> $version"
+  deploy_location "$location" "$version" false ok 0.0
+  wait_ready "$location" 20 || true
+}
+
+teardown() {
+  "${COMPOSE[@]}" down --remove-orphans
+  rm -rf "$STATE_DIR"
+}
+
+case "${1:-help}" in
+  help|-h|--help) usage ;;
+  setup) setup ;;
+  deploy) shift; deploy "$@" ;;
+  status) shift; status "${1:-}" ;;
+  load) shift; load "$@" ;;
+  degrade) shift; degrade "$@" ;;
+  recover) shift; recover "$@" ;;
+  canary) shift; canary "$@" ;;
+  rollout) shift; rollout "$@" ;;
+  rollback) shift; rollback "$@" ;;
+  teardown|down|cleanup) teardown ;;
+  *) echo "unknown command: $1" >&2; usage; exit 2 ;;
+esac
