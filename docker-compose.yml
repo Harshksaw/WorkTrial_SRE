@@ -1,0 +1,50 @@
+# Five simulated cities, all running the same worktrial-sre image.
+# Each city is one instance of the fake inference service, distinguished
+# only by env vars (LOCATION and BASE_LATENCY_MS). Ports 8001-8005 map to
+# the container's port 80.
+services:
+  vancouver:
+    build: .
+    image: worktrial-sre:latest
+    ports:
+      - "8001:80"
+    environment:
+      LOCATION: vancouver
+      VERSION: v1
+      BASE_LATENCY_MS: 120
+
+  toronto:
+    image: worktrial-sre:latest
+    ports:
+      - "8002:80"
+    environment:
+      LOCATION: toronto
+      VERSION: v1
+      BASE_LATENCY_MS: 160
+
+  london:
+    image: worktrial-sre:latest
+    ports:
+      - "8003:80"
+    environment:
+      LOCATION: london
+      VERSION: v1
+      BASE_LATENCY_MS: 220
+
+  frankfurt:
+    image: worktrial-sre:latest
+    ports:
+      - "8004:80"
+    environment:
+      LOCATION: frankfurt
+      VERSION: v1
+      BASE_LATENCY_MS: 200
+
+  singapore:
+    image: worktrial-sre:latest
+    ports:
+      - "8005:80"
+    environment:
+      LOCATION: singapore
+      VERSION: v1
+      BASE_LATENCY_MS: 300
