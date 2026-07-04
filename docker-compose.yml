@@ -69,6 +69,6 @@ services:
       <<: *common-env
       LOCATION: singapore
       BASE_LATENCY_MS: "300"
-      TAIL_LATENCY_MS: "450"
+      TAIL_LATENCY_MS: "320"
       GPU_UTILIZATION: "0.63"
       GPU_MEMORY_PERCENT: "0.67"
