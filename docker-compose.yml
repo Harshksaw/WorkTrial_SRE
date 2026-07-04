@@ -1,22 +1,74 @@
+x-service-base: &service-base
+  build: .
+  image: worktrial-sre:latest
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/ready', timeout=2)"]
+    interval: 5s
+    timeout: 3s
+    retries: 6
+    start_period: 3s
+
+x-common-env: &common-env
+  VERSION: ${VERSION:-v1}
+  ERROR_RATE: ${DEFAULT_ERROR_RATE:-0.0}
+  TAIL_PROBABILITY: ${DEFAULT_TAIL_PROBABILITY:-0.10}
+  DEGRADED_MODE: ${GLOBAL_DEGRADED_MODE:-false}
+  HEALTH_STATE: ${GLOBAL_HEALTH_STATE:-ok}
+  WARMUP_SECONDS: ${WARMUP_SECONDS:-2}
+
 services:
   vancouver:
-    build: .
-    image: worktrial-sre:latest
+    <<: *service-base
     ports: ["8001:80"]
-    environment: { LOCATION: vancouver, VERSION: v1, BASE_LATENCY_MS: "300" }
+    environment:
+      <<: *common-env
+      LOCATION: vancouver
+      BASE_LATENCY_MS: "120"
+      TAIL_LATENCY_MS: "180"
+      GPU_UTILIZATION: "0.42"
+      GPU_MEMORY_PERCENT: "0.50"
+
   toronto:
-    image: worktrial-sre:latest
+    <<: *service-base
     ports: ["8002:80"]
-    environment: { LOCATION: toronto, VERSION: v1, BASE_LATENCY_MS: "400" }
+    environment:
+      <<: *common-env
+      LOCATION: toronto
+      BASE_LATENCY_MS: "160"
+      TAIL_LATENCY_MS: "220"
+      GPU_UTILIZATION: "0.48"
+      GPU_MEMORY_PERCENT: "0.54"
+
   london:
-    image: worktrial-sre:latest
+    <<: *service-base
     ports: ["8003:80"]
-    environment: { LOCATION: london, VERSION: v1, BASE_LATENCY_MS: "500" }
+    environment:
+      <<: *common-env
+      LOCATION: london
+      BASE_LATENCY_MS: "220"
+      TAIL_LATENCY_MS: "300"
+      GPU_UTILIZATION: "0.55"
+      GPU_MEMORY_PERCENT: "0.61"
+
   frankfurt:
-    image: worktrial-sre:latest
+    <<: *service-base
     ports: ["8004:80"]
-    environment: { LOCATION: frankfurt, VERSION: v1, BASE_LATENCY_MS: "600" }
+    environment:
+      <<: *common-env
+      LOCATION: frankfurt
+      BASE_LATENCY_MS: "200"
+      TAIL_LATENCY_MS: "280"
+      GPU_UTILIZATION: "0.52"
+      GPU_MEMORY_PERCENT: "0.58"
+
   singapore:
-    image: worktrial-sre:latest
+    <<: *service-base
     ports: ["8005:80"]
-    environment: { LOCATION: singapore, VERSION: v1, BASE_LATENCY_MS: "800" }
+    environment:
+      <<: *common-env
+      LOCATION: singapore
+      BASE_LATENCY_MS: "300"
+      TAIL_LATENCY_MS: "450"
+      GPU_UTILIZATION: "0.63"
+      GPU_MEMORY_PERCENT: "0.67"
